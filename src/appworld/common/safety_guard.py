@@ -3,6 +3,7 @@ import faulthandler
 import importlib
 import io
 from collections.abc import Callable
+import sys
 from types import ModuleType
 from typing import IO, Any, cast
 
@@ -383,7 +384,7 @@ class SafetyGuard:
         return f"{module_name}.{function_name}"
 
     def disable(self) -> None:
-        faulthandler.enable()
+        faulthandler.enable(sys.__stderr__)
         for module_name, function_names in DISALLOWED_MODULE_TO_FUNCTION_NAMES.items():
             for function_name in function_names:
                 module = self.module_by_path(module_name)
