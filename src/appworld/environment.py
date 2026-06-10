@@ -714,6 +714,12 @@ class AppWorld:
         self.add_login_shortcut = add_login_shortcut
         self.munchify_response = munchify_response
         self.environment_io: list[dict[str, str]] = []
+        # Indices of the next ``environment_io`` / ``requester.request_tracker.requests``
+        # entries that haven't yet been flushed to disk. Used by the incremental
+        # save_logs path so each save() is O(new entries) instead of O(total
+        # entries so far). See ``_save_environment_io_log`` / ``_save_api_calls_log``.
+        self._env_io_written_count: int = 0
+        self._api_calls_written_count: int = 0
         self.models_to_db_home_path = self.output_db_home_path_in_memory
         self.models_from_db_home_path = (
             os.path.join("data", "tasks", task_id, "dbs")
@@ -1130,15 +1136,58 @@ class AppWorld:
         )
 
     def _save_api_calls_log(self) -> None:
+        """Persist accumulated request-tracker entries to ``api_calls.jsonl``.
+
+        Incremental: writes only entries appended since the last call,
+        producing identical on-disk content to the previous overwrite-everything
+        implementation. ``save_logs`` is called on every ``world.execute``,
+        so the previous O(N) per call became O(N^2) total for an agent that
+        issues N API calls in a single REPL iteration; with this change each
+        save is O(K) in the new entries, total O(N).
+
+        The tracker is reset only at ``Requester.close()`` / ``reset_requests``,
+        not during a task — so the counter cannot ordinarily run past the end.
+        We still defensively rewrite from scratch if it does (rather than
+        silently miss data).
+        """
         self._maybe_raise_remote_environment_error("_save_api_calls_log")
         save_api_calls_log_file_path = os.path.join(self.output_logs_directory, "api_calls.jsonl")
-        self.requester.request_tracker.save(save_api_calls_log_file_path)
+        cur = len(self.requester.request_tracker.requests)
+        if cur < self._api_calls_written_count:
+            # Tracker was reset out from under us; fall back to a full rewrite.
+            self.requester.request_tracker.save(save_api_calls_log_file_path)
+            self._api_calls_written_count = cur
+            return
+        if cur == self._api_calls_written_count:
+            return
+        self.requester.request_tracker.save(
+            save_api_calls_log_file_path,
+            start_index=self._api_calls_written_count,
+            append=self._api_calls_written_count > 0,
+        )
+        self._api_calls_written_count = cur
 
     def _save_environment_io_log(self) -> None:
+        """Persist accumulated ``environment_io`` entries to ``environment_io.md``.
+
+        Same incremental strategy as ``_save_api_calls_log`` above; see that
+        docstring for the motivation. Writes only entries appended since the
+        last call, producing identical on-disk content to the previous
+        overwrite-everything implementation.
+        """
         self._maybe_raise_remote_environment_error("_save_environment_io_log")
         environment_io_log_file_path = os.path.join(self.output_logs_directory, "environment_io.md")
-        with open(environment_io_log_file_path, "w") as file:
-            for entry in self.environment_io:
+        cur = len(self.environment_io)
+        if cur < self._env_io_written_count:
+            # environment_io shrank out from under us (shouldn't happen during
+            # a task, but be defensive); fall back to a full rewrite.
+            self._env_io_written_count = 0
+        if cur == self._env_io_written_count:
+            return
+        new_entries = self.environment_io[self._env_io_written_count:]
+        mode = "a" if self._env_io_written_count > 0 else "w"
+        with open(environment_io_log_file_path, mode) as file:
+            for entry in new_entries:
                 content = "\n".join(
                     [
                         f"\n### Environment Interaction {entry['number']}\n{SINGLE_HORIZONTAL_RULE}",
@@ -1147,6 +1196,7 @@ class AppWorld:
                     ]
                 )
                 file.write(content)
+        self._env_io_written_count = cur
 
     def save_logs(self) -> None:
         if self.remote_environment_url:

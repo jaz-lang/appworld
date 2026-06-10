@@ -105,11 +105,33 @@ class RequestTracker:
         ]
         return request_tracker
 
-    def save(self, file_path: str) -> None:
+    def save(
+        self,
+        file_path: str,
+        *,
+        start_index: int = 0,
+        append: bool = False,
+    ) -> None:
+        """Serialize tracked requests to ``file_path``.
+
+        Backwards-compatible default (``start_index=0, append=False``):
+        writes the entire list in mode ``'w'``, exactly as before.
+
+        New incremental mode (``start_index=N, append=True``): writes only
+        ``self.requests[N:]`` in append mode. This lets a caller drop the
+        per-call cost from O(N) to O(K) where K is the number of new
+        requests since the last save — important when ``save`` is invoked
+        on every ``world.execute`` call in a long-running task. See
+        ``AppWorld._save_api_calls_log`` for the caller that uses this.
+        """
+        requests_to_save = self.requests[start_index:]
+        if not requests_to_save and append:
+            # Nothing new to write and we're not (re)creating the file.
+            return
         serialized_requests: list[dict[str, Any]] = [
-            cast_dict(jsonable_encoder(request)) for request in self.requests
+            cast_dict(jsonable_encoder(request)) for request in requests_to_save
         ]
-        write_jsonl(serialized_requests, file_path, silent=True)
+        write_jsonl(serialized_requests, file_path, silent=True, append=append)
 
 
 class RequestTimeTracker:
