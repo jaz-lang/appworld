@@ -289,7 +289,20 @@ def get_db_engine(db_app_path: str) -> SQLEngine:
         )
     else:
         maybe_create_parent_directory(db_app_path)
-        engine = create_engine(f"sqlite:///{db_app_path}")
+        # Stated explicitly, though SQLAlchemy's pysqlite dialect already defaults it to False for a
+        # file-backed url (verified on 2.0.52: `dialect.create_connect_args` -> `check_same_thread:
+        # False`). It is here to pin that default, since `get_cached_db_engine` is `@lru_cache`d on the
+        # path and hands this engine to whichever thread asks next -- if the dialect default ever
+        # changed, cross-thread callers would start raising `ProgrammingError`.
+        #
+        # This is safe for the same reason the default is: `QueuePool` checks a connection out to one
+        # caller at a time, so the flag permits sequential reuse across threads, never simultaneous
+        # use. (The two `:memory:` branches above must set it for a stronger reason -- `StaticPool`
+        # genuinely shares one connection between every caller.)
+        engine = create_engine(
+            f"sqlite:///{db_app_path}",
+            connect_args={"check_same_thread": False},
+        )
     return engine
 
 
@@ -299,7 +312,17 @@ def get_direct_cached_sqlite3_connection(db_app_path: str) -> SQLite3Connection:
 
 
 def get_direct_sqlite3_connection(db_app_path: str) -> SQLite3Connection:
-    connection = sqlite3.connect(db_app_path)
+    # `check_same_thread=False` because `get_direct_cached_sqlite3_connection` is `@lru_cache`d on the
+    # path. Unlike the pooled engine above, that caches the connection OBJECT, so every thread shares
+    # this connection's single implicit transaction.
+    #
+    # Safe only because the one caller (`copy_db`) reads through it, as the source of
+    # `from_db_connection.backup(...)` -- no writes, so there is no implicit `BEGIN` to interleave. Do
+    # not write through this connection: two threads doing so would share a transaction, where one
+    # thread's `commit()` commits the other's half-finished work. `sqlite3.threadsafety == 3` does not
+    # help there -- serialized mode protects the driver's own state, it does not make a statement
+    # sequence atomic.
+    connection = sqlite3.connect(db_app_path, check_same_thread=False)
     connection.execute("PRAGMA mmap_size = 268435456")  # 256MB
     return connection
 

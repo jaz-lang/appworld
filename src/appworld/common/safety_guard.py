@@ -2,8 +2,8 @@ import builtins
 import faulthandler
 import importlib
 import io
-from collections.abc import Callable
 import sys
+from collections.abc import Callable
 from types import ModuleType
 from typing import IO, Any, cast
 
@@ -384,6 +384,9 @@ class SafetyGuard:
         return f"{module_name}.{function_name}"
 
     def disable(self) -> None:
+        # `sys.__stderr__`, not the default: when `sys.stderr` has been replaced by a stream with no
+        # underlying fd -- which is exactly what a parent REPL does -- bare `faulthandler.enable()`
+        # raises `io.UnsupportedOperation: fileno`. `sys.__stderr__` keeps the real fd.
         faulthandler.enable(sys.__stderr__)
         for module_name, function_names in DISALLOWED_MODULE_TO_FUNCTION_NAMES.items():
             for function_name in function_names:
