@@ -166,6 +166,11 @@ def non_cached_lm_call(
     n: int | None = None,
     parallel_tool_calls: bool | None = None,
     presence_penalty: float | None = None,
+    # OpenAI's per-request cache-routing hint. Requests sharing a key are steered to the same
+    # cache-warm backend, so a run reliably hits its own growing-prefix cache instead of a sibling's.
+    # Without it, concurrent reps of one experiment share cache entries -- their cached-token counts
+    # and costs stop being independent, which is exactly what a per-rep comparison needs them to be.
+    prompt_cache_key: str | None = None,
     reasoning: dict[str, Any] | None = None,
     reasoning_effort: Literal["low", "medium", "high"] | None = None,
     response_format: dict[str, Any] | None = None,
@@ -213,6 +218,8 @@ def non_cached_lm_call(
         kwargs["parallel_tool_calls"] = parallel_tool_calls
     if presence_penalty is not None:
         kwargs["presence_penalty"] = presence_penalty
+    if prompt_cache_key is not None:
+        kwargs["prompt_cache_key"] = prompt_cache_key
     if reasoning is not None:
         kwargs["reasoning"] = reasoning
     if reasoning_effort is not None:
@@ -293,6 +300,11 @@ def cached_lm_call(
     n: int | None = None,
     parallel_tool_calls: bool | None = None,
     presence_penalty: float | None = None,
+    # OpenAI's per-request cache-routing hint. Requests sharing a key are steered to the same
+    # cache-warm backend, so a run reliably hits its own growing-prefix cache instead of a sibling's.
+    # Without it, concurrent reps of one experiment share cache entries -- their cached-token counts
+    # and costs stop being independent, which is exactly what a per-rep comparison needs them to be.
+    prompt_cache_key: str | None = None,
     reasoning: dict[str, Any] | None = None,
     reasoning_effort: Literal["low", "medium", "high"] | None = None,
     response_format: dict[str, Any] | None = None,
@@ -325,6 +337,7 @@ def cached_lm_call(
         n=n,
         parallel_tool_calls=parallel_tool_calls,
         presence_penalty=presence_penalty,
+        prompt_cache_key=prompt_cache_key,
         reasoning=reasoning,
         reasoning_effort=reasoning_effort,
         response_format=response_format,
@@ -358,6 +371,11 @@ def chat_completion_to_responses_input(
     n: int | None = None,
     parallel_tool_calls: bool | None = None,
     presence_penalty: float | None = None,
+    # OpenAI's per-request cache-routing hint. Requests sharing a key are steered to the same
+    # cache-warm backend, so a run reliably hits its own growing-prefix cache instead of a sibling's.
+    # Without it, concurrent reps of one experiment share cache entries -- their cached-token counts
+    # and costs stop being independent, which is exactly what a per-rep comparison needs them to be.
+    prompt_cache_key: str | None = None,
     reasoning: dict[str, Any] | None = None,
     reasoning_effort: Literal["low", "medium", "high"] | None = None,
     response_format: dict[str, Any] | None = None,
@@ -417,6 +435,8 @@ def chat_completion_to_responses_input(
         responses_kwargs["parallel_tool_calls"] = parallel_tool_calls
     if presence_penalty is not None:
         responses_kwargs["presence_penalty"] = presence_penalty
+    if prompt_cache_key is not None:
+        responses_kwargs["prompt_cache_key"] = prompt_cache_key
     if reasoning is not None:
         responses_kwargs["reasoning"] = reasoning
     if reasoning_effort is not None:
