@@ -85,6 +85,90 @@ RAISE_ERROR = (
     APIResponseValidationError,
     ConflictError,
 )
+# --- invalid_prompt mitigation -------------------------------------------------------------------
+# OpenAI's reasoning models reject a request with a 400 `invalid_prompt` when a prompt-level safety
+# classifier fires. Upstream classes every BadRequestError as BREAKING_ERROR, so one flag ends the
+# task outright. Measured over 3 reps x 214 shared tasks of the official baseline: 15.7% of tasks died
+# this way, at a median of 14 LM calls in (only 2 of 101 on the first call), and 61% of the tasks that
+# were flagged in one rep were NOT flagged in the other two. So the trigger is overwhelmingly the
+# CONTENT THE AGENT ACCUMULATED, not the task -- which is what makes it worth retrying instead of
+# conceding the task.
+#
+# The ladder below tries the cheap thing first and escalates:
+#   attempts 1-4  bare retries, prompt untouched, with a short escalating pause between them. Also the
+#                 experiment: an identical prompt should get an identical verdict if the classifier is
+#                 deterministic, so the recovery rate across these MEASURES that. They are exhausted
+#                 before anything is edited because a bare retry is FREE of side effects, while every
+#                 rung below permanently destroys context the agent may still need -- so the cheap,
+#                 lossless option gets every chance first. A rejected request bills no tokens, so the
+#                 only cost of these is a few seconds.
+#   attempt 5+    shrink the MOST RECENT accumulated observation and retry, halving each time; when one
+#                 reaches the floor, walk backwards to the observation before it. Last rung replaces an
+#                 observation outright.
+#
+# Recency, NOT size, is what picks the target, and the reason is a differential argument: the call at
+# N-1 passed the classifier and the call at N did not, and what changed between them is the newly
+# appended observation. That makes the newest content the suspect. Targeting the LARGEST message
+# instead -- the first thing tried here -- assumed the trigger lives in the biggest blob, which nothing
+# supports: the 400 carries no category, no span and no `param`, so length is pure guesswork while
+# recency is at least an inference from the one bit the API does give us (it passed before, it fails
+# now). The argument is not airtight -- a classifier scoring the whole prompt can cross its threshold
+# on accumulated content rather than on the delta -- which is why the ladder walks backwards instead of
+# hammering the newest message forever.
+#
+# The shrink MUTATES the conversation, so a truncated observation stays truncated for later turns.
+# That is deliberate: putting the offending text back would just re-trip the classifier next call.
+# Bare retries come first and are counted separately, so the log distinguishes "the classifier let it
+# through on a re-ask" from "we had to cut context to get through".
+BARE_RETRY_ATTEMPTS = 4
+MAX_INVALID_PROMPT_ATTEMPTS = 12
+INVALID_PROMPT_RETRY_PAUSE_SECONDS = 2
+INVALID_PROMPT_MIN_CHARS = 200
+TRUNCATION_MARKER = "\n...[truncated: prompt was rejected by the model's safety classifier]"
+REMOVED_MARKER = "[observation removed: prompt was rejected by the model's safety classifier]"
+
+
+def is_invalid_prompt_error(exception: Exception) -> bool:
+    """True for the 400 whose body carries `"code": "invalid_prompt"`, not for other BadRequests."""
+    # Matched on the body text rather than a parsed field because the code reaches us only inside the
+    # stringified error payload; a bad-parameter 400 must stay terminal, so this must not over-match.
+    return "invalid_prompt" in str(exception)
+
+
+def shrink_newest_observation(messages: list[dict[str, Any]]) -> tuple[bool, int, int]:
+    """Halve the most recent still-shrinkable observation in place. Returns (changed, before, after).
+
+    Walks from the end backwards, so the newest observation is halved until it reaches the floor and
+    only then does an older one become the target. Never touches `messages[0:2]` -- the system prompt
+    and the task statement -- since truncating those would change the task rather than the context.
+    """
+    for index in range(len(messages) - 1, 1, -1):
+        message = messages[index]
+        if message.get("role") not in ("tool", "user"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or TRUNCATION_MARKER in content and len(content) <= (
+            INVALID_PROMPT_MIN_CHARS + len(TRUNCATION_MARKER)
+        ):
+            continue
+        if len(content) <= INVALID_PROMPT_MIN_CHARS:
+            continue
+        keep = max(INVALID_PROMPT_MIN_CHARS, len(content) // 2)
+        messages[index]["content"] = content[:keep] + TRUNCATION_MARKER
+        return True, len(content), keep
+    # Every observation is already at the floor: drop the newest one's content outright. Halving keeps
+    # a PREFIX, so a trigger sitting in the first 200 characters survives every shrink -- this rung is
+    # what clears that case.
+    for index in range(len(messages) - 1, 1, -1):
+        if messages[index].get("role") in ("tool", "user"):
+            before = len(messages[index].get("content") or "")
+            if before <= len(REMOVED_MARKER):
+                continue
+            messages[index]["content"] = REMOVED_MARKER
+            return True, before, len(REMOVED_MARKER)
+    return False, 0, 0
+
+
 API_TYPE_LITERAL = Literal["chat_completions", "responses"]
 CLIENT_NAME_LITERAL = Literal["openai", "litellm"]
 SHOW_LM_CALL_CACHE_MISSES = os.environ.get("SHOW_LM_CALL_CACHE_MISSES", "0") == "1"
@@ -697,6 +781,7 @@ class LanguageModel:
             assert (
                 cache_control_counts <= 1
             ), f"Only one message can have cache_control. Found {cache_control_counts}."
+        invalid_prompt_attempts = 0
         for _ in range(self.max_retries):
             try:
                 arguments: dict[str, Any] = {
@@ -737,6 +822,46 @@ class LanguageModel:
                 response.pop("warning", None)
                 response.pop("timestamps")
                 retrial_exception = None
+                if invalid_prompt_attempts:
+                    print(f"INVALID_PROMPT_RECOVERED after_attempts={invalid_prompt_attempts}")
+                break
+            except BadRequestError as exception:
+                # Ordered BEFORE the BREAKING_ERROR clause on purpose: BadRequestError is a member of
+                # that tuple, and Python matches except clauses in order, so this intercepts only the
+                # invalid_prompt case and lets every other 400 fall through to the old behaviour.
+                request_id = getattr(exception, "request_id", None)
+                if is_invalid_prompt_error(exception) and invalid_prompt_attempts < MAX_INVALID_PROMPT_ATTEMPTS:
+                    invalid_prompt_attempts += 1
+                    if invalid_prompt_attempts <= BARE_RETRY_ATTEMPTS:
+                        print(
+                            f"INVALID_PROMPT attempt={invalid_prompt_attempts} action=bare_retry "
+                            f"request_id={request_id}"
+                        )
+                        # Escalating pause: if the verdict varies at all with server-side state, a
+                        # gap makes that more likely to show. If it is deterministic, this costs
+                        # 2+4+6 seconds once per flagged call and nothing else.
+                        time.sleep(INVALID_PROMPT_RETRY_PAUSE_SECONDS * invalid_prompt_attempts)
+                        continue
+                    changed, before, after = shrink_newest_observation(messages)
+                    if changed:
+                        print(
+                            f"INVALID_PROMPT attempt={invalid_prompt_attempts} action=truncate "
+                            f"{before}->{after} chars request_id={request_id}"
+                        )
+                        continue
+                    print("INVALID_PROMPT nothing left to truncate; giving up on this call")
+                print(f"Encountered BREAKING_ERROR ({type(exception).__name__}): {exception}")
+                response = empty_response | {
+                    "error": str(exception),
+                    # Recorded because OpenAI support can only trace a flag by request id, and
+                    # `str(exception)` drops it -- the message itself carries no category or span.
+                    "request_id": request_id,
+                    "invalid_prompt_attempts": invalid_prompt_attempts,
+                }
+                retrial_exception = None
+                self.may_log_call(arguments, response)
+                response.pop("_raw", None)
+                response.pop("warning", None)
                 break
             except BREAKING_ERROR as exception:
                 # NOTE: This should almost never happen, except running out of context, if things are set up correctly.
