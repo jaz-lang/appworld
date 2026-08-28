@@ -129,3 +129,11 @@ generate/tasks/task_generators/
 tests/package/apps
 tests/generation
 # !generate/data
+
+# Artifacts of jaz-evals' official-baseline runner (jaz-evals-internal#135), which generates a
+# per-rep jsonnet config and a timestamped log dir on every launch. Ignored rather than tracked
+# because they are run outputs, not source: a name carries a UTC stamp, so they accumulate one set
+# per launch and would otherwise turn this fork's history into a pile of generated files instead of
+# the linear patch series on upstream that it is meant to stay.
+logs_official_react_*/
+experiments/configs/**/test_*_rep[0-9]*_*.jsonnet
